@@ -12,52 +12,27 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 # ============================================================
-#                 ENCRYPTION CONFIGURATION
+#                    SERVER CONFIGURATION
 # ============================================================
 
-# The same key must be used in client.py
-
-SECRET_KEY = b"nJuxFgnows1o0BjplCFyNYrmSLXjN1w9T86JD2upISY="
-
-cipher = Fernet(SECRET_KEY)
-
-
-# ============================================================
-#                 LOAD MACHINE LEARNING MODEL
-# ============================================================
-
-with open("sqli_model.pkl", "rb") as file:
-    model = pickle.load(file)
-
-with open("tfidf_vectorizer.pkl", "rb") as file:
-    vectorizer = pickle.load(file)
-
-
-# ============================================================
-#                 THREAD POOL CONFIGURATION
-# ============================================================
+HOST = "127.0.0.1"
+PORT = 5000
 
 MAX_WORKERS = 10
 
-thread_pool = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS
-)
+# Maximum TCP request that the server will accept
+MAX_REQUEST_SIZE = 8192
+
+# Client connection timeout
+CONNECTION_TIMEOUT = 3
 
 
 # ============================================================
-#                 BLOCKED SOURCE PORTS
-# ============================================================
-
-blocked_ports = set()
-
-blocked_ports_lock = threading.Lock()
-
-
-# ============================================================
-#                 TOKEN BUCKET CONFIGURATION
+#                    RATE LIMIT CONFIGURATION
 # ============================================================
 
 MAX_TOKENS = 3
+
 REFILL_RATE = 1
 
 client_buckets = {}
@@ -66,16 +41,559 @@ client_buckets_lock = threading.Lock()
 
 
 # ============================================================
-#                 TOKEN BUCKET RATE LIMITER
+#                    IP BLOCK CONFIGURATION
 # ============================================================
 
-def allow_request(client_ip):
-    """
-    Check whether a client is allowed to send a request.
+# Temporary IP block duration
+BLOCK_DURATION = 60
 
-    Each client receives:
-    - 3 initial tokens
-    - 1 new token every second
+blocked_ips = {}
+
+blocked_ips_lock = threading.Lock()
+
+
+# ============================================================
+#                    CONNECTION TRACKING
+# ============================================================
+
+active_connections = {}
+
+active_connections_lock = threading.Lock()
+
+
+# ============================================================
+#                    SERVER STATISTICS
+# ============================================================
+
+statistics = {
+    "total_requests": 0,
+    "allowed_requests": 0,
+    "blocked_requests": 0,
+    "rate_limited_requests": 0,
+    "invalid_requests": 0,
+    "get_requests": 0,
+    "post_requests": 0,
+    "unique_ips": set()
+}
+
+statistics_lock = threading.Lock()
+
+
+# ============================================================
+#                    THREAD POOL
+# ============================================================
+
+thread_pool = ThreadPoolExecutor(
+    max_workers=MAX_WORKERS
+)
+
+
+# ============================================================
+#                    ENCRYPTION CONFIGURATION
+# ============================================================
+
+def load_fernet_key():
+
+    """
+    Read Fernet key from README.md.
+    """
+
+    try:
+
+        with open(
+            "README.md",
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            for line in file:
+
+                line = line.strip()
+
+                if line.startswith("FERNET_KEY="):
+
+                    key = line.split(
+                        "=",
+                        1
+                    )[1].strip()
+
+                    return key.encode("utf-8")
+
+    except FileNotFoundError:
+
+        raise FileNotFoundError(
+            "README.md not found."
+        )
+
+    raise ValueError(
+        "FERNET_KEY not found in README.md."
+    )
+
+
+SECRET_KEY = load_fernet_key()
+
+cipher = Fernet(
+    SECRET_KEY
+)
+
+
+# ============================================================
+#                    LOAD ML MODEL
+# ============================================================
+
+print("\nLoading machine learning model...")
+
+with open(
+    "sqli_model.pkl",
+    "rb"
+) as file:
+
+    model = pickle.load(file)
+
+
+print("Loading TF-IDF vectorizer...")
+
+with open(
+    "tfidf_vectorizer.pkl",
+    "rb"
+) as file:
+
+    vectorizer = pickle.load(file)
+
+
+print("Machine learning model loaded successfully.")
+
+
+# ============================================================
+#                    DATABASE INITIALIZATION
+# ============================================================
+
+def initialize_database():
+
+    connection = sqlite3.connect(
+        "security_logs.db"
+    )
+
+    cursor = connection.cursor()
+
+
+    # --------------------------------------------------------
+    # Security logs
+    # --------------------------------------------------------
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_logs
+        (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            timestamp TEXT,
+
+            client_ip TEXT,
+
+            client_port INTEGER,
+
+            protocol TEXT,
+
+            request TEXT,
+
+            request_size INTEGER,
+
+            connection_duration REAL,
+
+            prediction TEXT,
+
+            action TEXT
+        )
+        """
+    )
+
+
+    # --------------------------------------------------------
+    # Persistent blocked IP table
+    # --------------------------------------------------------
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blocked_ips
+        (
+            ip_address TEXT PRIMARY KEY,
+
+            reason TEXT,
+
+            blocked_at TEXT,
+
+            expires_at TEXT
+        )
+        """
+    )
+
+
+    connection.commit()
+
+    connection.close()
+
+
+initialize_database()
+
+
+# ============================================================
+#                    LOAD BLOCKED IPS
+# ============================================================
+
+def load_blocked_ips():
+
+    """
+    Load previously blocked IP addresses from SQLite.
+    """
+
+    connection = sqlite3.connect(
+        "security_logs.db"
+    )
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            ip_address,
+            reason,
+            expires_at
+        FROM blocked_ips
+        """
+    )
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+
+    current_time = time.time()
+
+
+    with blocked_ips_lock:
+
+        for ip_address, reason, expires_at in rows:
+
+            try:
+
+                expiry_timestamp = float(
+                    expires_at
+                )
+
+                if expiry_timestamp > current_time:
+
+                    blocked_ips[ip_address] = {
+                        "reason": reason,
+                        "expires_at": expiry_timestamp
+                    }
+
+            except ValueError:
+
+                pass
+
+
+load_blocked_ips()
+
+
+# ============================================================
+#                    BLOCK IP
+# ============================================================
+
+def block_ip(
+    client_ip,
+    reason
+):
+
+    """
+    Block an IP address temporarily.
+
+    The block is also saved in SQLite so that
+    it survives a server restart.
+    """
+
+    current_time = time.time()
+
+    expiry_time = (
+        current_time +
+        BLOCK_DURATION
+    )
+
+    blocked_time = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    with blocked_ips_lock:
+
+        blocked_ips[client_ip] = {
+            "reason": reason,
+            "expires_at": expiry_time
+        }
+
+
+    connection = sqlite3.connect(
+        "security_logs.db"
+    )
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO blocked_ips
+        (
+            ip_address,
+            reason,
+            blocked_at,
+            expires_at
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            client_ip,
+            reason,
+            blocked_time,
+            str(expiry_time)
+        )
+    )
+
+    connection.commit()
+
+    connection.close()
+
+
+    print(
+        "\n=============================================="
+    )
+
+    print(
+        "IP BLOCKED"
+    )
+
+    print(
+        "IP:",
+        client_ip
+    )
+
+    print(
+        "Reason:",
+        reason
+    )
+
+    print(
+        "Duration:",
+        BLOCK_DURATION,
+        "seconds"
+    )
+
+    print(
+        "=============================================="
+    )
+
+
+# ============================================================
+#                    CHECK IP BLOCK
+# ============================================================
+
+def is_ip_blocked(
+    client_ip
+):
+
+    """
+    Check whether an IP is currently blocked.
+    """
+
+    current_time = time.time()
+
+    with blocked_ips_lock:
+
+        if client_ip not in blocked_ips:
+
+            return False
+
+
+        block_information = blocked_ips[
+            client_ip
+        ]
+
+        expiry_time = block_information[
+            "expires_at"
+        ]
+
+
+        # ----------------------------------------------------
+        # Remove expired block
+        # ----------------------------------------------------
+
+        if current_time >= expiry_time:
+
+            del blocked_ips[
+                client_ip
+            ]
+
+            return False
+
+
+        return True
+
+
+# ============================================================
+#                    UNBLOCK IP
+# ============================================================
+
+def unblock_ip(
+    client_ip
+):
+
+    """
+    Remove an IP address from the blocked list.
+    """
+
+    removed = False
+
+    with blocked_ips_lock:
+
+        if client_ip in blocked_ips:
+
+            del blocked_ips[
+                client_ip
+            ]
+
+            removed = True
+
+
+    if removed:
+
+        connection = sqlite3.connect(
+            "security_logs.db"
+        )
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM blocked_ips
+            WHERE ip_address = ?
+            """,
+            (
+                client_ip,
+            )
+        )
+
+        connection.commit()
+
+        connection.close()
+
+
+        print(
+            "IP unblocked:",
+            client_ip
+        )
+
+        return True
+
+
+    print(
+        "IP was not blocked:",
+        client_ip
+    )
+
+    return False
+
+
+# ============================================================
+#                    LIST BLOCKED IPS
+# ============================================================
+
+def list_blocked_ips():
+
+    """
+    Display currently blocked IP addresses.
+    """
+
+    current_time = time.time()
+
+    print(
+        "\n=============================================="
+    )
+
+    print(
+        "              BLOCKED IP ADDRESSES"
+    )
+
+    print(
+        "=============================================="
+    )
+
+
+    with blocked_ips_lock:
+
+        if not blocked_ips:
+
+            print(
+                "No blocked IP addresses."
+            )
+
+            return
+
+
+        for ip_address, information in list(
+            blocked_ips.items()
+        ):
+
+            remaining = (
+                information["expires_at"]
+                -
+                current_time
+            )
+
+            if remaining <= 0:
+
+                del blocked_ips[
+                    ip_address
+                ]
+
+                continue
+
+
+            print(
+                "IP:",
+                ip_address
+            )
+
+            print(
+                "Reason:",
+                information["reason"]
+            )
+
+            print(
+                "Remaining:",
+                round(
+                    remaining,
+                    1
+                ),
+                "seconds"
+            )
+
+            print(
+                "----------------------------------------------"
+            )
+
+
+# ============================================================
+#                    TOKEN BUCKET
+# ============================================================
+
+def allow_request(
+    client_ip
+):
+
+    """
+    Token bucket rate limiter.
+
+    Each IP receives:
+
+        3 initial tokens
+        1 token per second
     """
 
     current_time = time.time()
@@ -85,24 +603,41 @@ def allow_request(client_ip):
         if client_ip not in client_buckets:
 
             client_buckets[client_ip] = {
+
                 "tokens": MAX_TOKENS,
+
                 "last_refill": current_time
             }
 
-        bucket = client_buckets[client_ip]
+
+        bucket = client_buckets[
+            client_ip
+        ]
+
 
         elapsed_time = (
-            current_time - bucket["last_refill"]
+            current_time -
+            bucket["last_refill"]
         )
 
-        new_tokens = elapsed_time * REFILL_RATE
+
+        new_tokens = (
+            elapsed_time *
+            REFILL_RATE
+        )
+
 
         bucket["tokens"] = min(
             MAX_TOKENS,
-            bucket["tokens"] + new_tokens
+            bucket["tokens"] +
+            new_tokens
         )
 
-        bucket["last_refill"] = current_time
+
+        bucket["last_refill"] = (
+            current_time
+        )
+
 
         if bucket["tokens"] >= 1:
 
@@ -110,17 +645,215 @@ def allow_request(client_ip):
 
             return True
 
+
         return False
 
 
 # ============================================================
-#                 SEND ENCRYPTED RESPONSE
+#                    CONNECTION TRACKING
 # ============================================================
 
-def send_encrypted_response(client_socket, response):
+def add_connection(
+    client_ip,
+    client_port
+):
+
     """
-    Encrypt and send a response to the client.
+    Add an active connection.
     """
+
+    connection_id = (
+        f"{client_ip}:{client_port}"
+    )
+
+    with active_connections_lock:
+
+        active_connections[
+            connection_id
+        ] = {
+
+            "ip": client_ip,
+
+            "port": client_port,
+
+            "start_time": time.time()
+        }
+
+
+def remove_connection(
+    client_ip,
+    client_port
+):
+
+    """
+    Remove a connection after completion.
+    """
+
+    connection_id = (
+        f"{client_ip}:{client_port}"
+    )
+
+    with active_connections_lock:
+
+        active_connections.pop(
+            connection_id,
+            None
+        )
+
+
+def show_active_connections():
+
+    """
+    Display active TCP connections.
+    """
+
+    print(
+        "\n=============================================="
+    )
+
+    print(
+        "             ACTIVE CONNECTIONS"
+    )
+
+    print(
+        "=============================================="
+    )
+
+
+    with active_connections_lock:
+
+        if not active_connections:
+
+            print(
+                "No active connections."
+            )
+
+            return
+
+
+        for connection_id, information in (
+            active_connections.items()
+        ):
+
+            duration = (
+                time.time() -
+                information["start_time"]
+            )
+
+            print(
+                "Connection:",
+                connection_id
+            )
+
+            print(
+                "Duration:",
+                round(
+                    duration,
+                    2
+                ),
+                "seconds"
+            )
+
+            print(
+                "----------------------------------------------"
+            )
+
+
+# ============================================================
+#                    STATISTICS
+# ============================================================
+
+def show_statistics():
+
+    """
+    Display server network statistics.
+    """
+
+    with statistics_lock:
+
+        print(
+            "\n=============================================="
+        )
+
+        print(
+            "             NETWORK STATISTICS"
+        )
+
+        print(
+            "=============================================="
+        )
+
+        print(
+            "Total Requests:",
+            statistics[
+                "total_requests"
+            ]
+        )
+
+        print(
+            "Allowed Requests:",
+            statistics[
+                "allowed_requests"
+            ]
+        )
+
+        print(
+            "Blocked Requests:",
+            statistics[
+                "blocked_requests"
+            ]
+        )
+
+        print(
+            "Rate Limited:",
+            statistics[
+                "rate_limited_requests"
+            ]
+        )
+
+        print(
+            "Invalid Requests:",
+            statistics[
+                "invalid_requests"
+            ]
+        )
+
+        print(
+            "GET Requests:",
+            statistics[
+                "get_requests"
+            ]
+        )
+
+        print(
+            "POST Requests:",
+            statistics[
+                "post_requests"
+            ]
+        )
+
+        print(
+            "Unique IP Addresses:",
+            len(
+                statistics[
+                    "unique_ips"
+                ]
+            )
+        )
+
+        print(
+            "=============================================="
+        )
+
+
+# ============================================================
+#                    SEND ENCRYPTED RESPONSE
+# ============================================================
+
+def send_encrypted_response(
+    client_socket,
+    response
+):
 
     encrypted_response = cipher.encrypt(
         response.encode("utf-8")
@@ -132,7 +865,7 @@ def send_encrypted_response(client_socket, response):
 
 
 # ============================================================
-#                 SAVE SECURITY LOG
+#                    SAVE SECURITY LOG
 # ============================================================
 
 def save_log(
@@ -144,9 +877,6 @@ def save_log(
     request_size,
     connection_duration
 ):
-    """
-    Save security events into the SQLite database.
-    """
 
     connection = sqlite3.connect(
         "security_logs.db"
@@ -157,6 +887,7 @@ def save_log(
     timestamp = datetime.now().strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+
 
     cursor.execute(
         """
@@ -187,83 +918,95 @@ def save_log(
         )
     )
 
+
     connection.commit()
+
     connection.close()
 
 
 # ============================================================
-#                 HANDLE CLIENT REQUEST
+#                    HANDLE CLIENT
 # ============================================================
 
-def handle_client(client_socket, client_address):
-    """
-    Process one encrypted client request.
-    """
+def handle_client(
+    client_socket,
+    client_address
+):
 
     client_ip = client_address[0]
+
     client_port = client_address[1]
 
     connection_start = datetime.now()
 
-    # Prevent indefinite waiting
-    client_socket.settimeout(3)
 
-    print("\n==============================================")
-    print("Client connected!")
-    print("Client IP:", client_ip)
-    print("Client Port:", client_port)
-    print("==============================================")
+    client_socket.settimeout(
+        CONNECTION_TIMEOUT
+    )
+
+
+    add_connection(
+        client_ip,
+        client_port
+    )
+
+
+    with statistics_lock:
+
+        statistics[
+            "total_requests"
+        ] += 1
+
+        statistics[
+            "unique_ips"
+        ].add(
+            client_ip
+        )
+
+
+    print(
+        "\n=============================================="
+    )
+
+    print(
+        "CLIENT CONNECTED"
+    )
+
+    print(
+        "IP:",
+        client_ip
+    )
+
+    print(
+        "PORT:",
+        client_port
+    )
+
+    print(
+        "=============================================="
+    )
+
 
     try:
 
-        # ----------------------------------------------------
-        # Check token bucket rate limit
-        # ----------------------------------------------------
+        # ====================================================
+        # IP BLOCK CHECK
+        # ====================================================
 
-        if not allow_request(client_ip):
+        if is_ip_blocked(
+            client_ip
+        ):
 
-            print("\nRate limit exceeded!")
-            print("Client IP:", client_ip)
-
-            response = (
-                "HTTP/1.1 429 Too Many Requests\r\n"
-                "Content-Type: text/plain\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "Too many requests. Please try again later."
+            print(
+                "Blocked IP attempted connection."
             )
-
-            send_encrypted_response(
-                client_socket,
-                response
-            )
-
-            return
-
-        print("Rate limit check: PASSED")
-
-        # ----------------------------------------------------
-        # Check whether the source port is blocked
-        # ----------------------------------------------------
-
-        with blocked_ports_lock:
-
-            port_is_blocked = (
-                client_port in blocked_ports
-            )
-
-        if port_is_blocked:
-
-            print("\nBlocked source port detected!")
-            print("Client IP:", client_ip)
-            print("Blocked Port:", client_port)
 
             response = (
                 "HTTP/1.1 403 Forbidden\r\n"
                 "Content-Type: text/plain\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "Source port is blocked."
+                "Your IP address is currently blocked."
             )
 
             send_encrypted_response(
@@ -271,36 +1014,122 @@ def handle_client(client_socket, client_address):
                 response
             )
 
+            with statistics_lock:
+
+                statistics[
+                    "blocked_requests"
+                ] += 1
+
             return
 
-        # ----------------------------------------------------
-        # Receive encrypted request
-        # ----------------------------------------------------
 
-        encrypted_data = client_socket.recv(4096)
+        # ====================================================
+        # RATE LIMIT CHECK
+        # ====================================================
+
+        if not allow_request(
+            client_ip
+        ):
+
+            print(
+                "Rate limit exceeded."
+            )
+
+            response = (
+                "HTTP/1.1 429 Too Many Requests\r\n"
+                "Content-Type: text/plain\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Too many requests. "
+                "Please try again later."
+            )
+
+            send_encrypted_response(
+                client_socket,
+                response
+            )
+
+            with statistics_lock:
+
+                statistics[
+                    "rate_limited_requests"
+                ] += 1
+
+            return
+
+
+        # ====================================================
+        # RECEIVE ENCRYPTED DATA
+        # ====================================================
+
+        encrypted_data = client_socket.recv(
+            MAX_REQUEST_SIZE
+        )
+
 
         if not encrypted_data:
 
-            print("Empty encrypted request received.")
+            print(
+                "Empty request received."
+            )
 
             return
 
-        print("\nEncrypted request received:")
-        print(encrypted_data.decode("utf-8"))
 
-        # ----------------------------------------------------
-        # Decrypt request
-        # ----------------------------------------------------
+        # ====================================================
+        # REQUEST SIZE CHECK
+        # ====================================================
+
+        if len(encrypted_data) >= MAX_REQUEST_SIZE:
+
+            print(
+                "Request size exceeded limit."
+            )
+
+            response = (
+                "HTTP/1.1 413 Payload Too Large\r\n"
+                "Content-Type: text/plain\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Request is too large."
+            )
+
+            send_encrypted_response(
+                client_socket,
+                response
+            )
+
+            with statistics_lock:
+
+                statistics[
+                    "blocked_requests"
+                ] += 1
+
+            return
+
+
+        print(
+            "\nEncrypted request received."
+        )
+
+
+        # ====================================================
+        # DECRYPT REQUEST
+        # ====================================================
 
         try:
 
             data = cipher.decrypt(
                 encrypted_data
-            ).decode("utf-8")
+            ).decode(
+                "utf-8"
+            )
 
         except InvalidToken:
 
-            print("Invalid encryption key or corrupted request.")
+            print(
+                "Invalid encrypted request."
+            )
 
             response = (
                 "HTTP/1.1 400 Bad Request\r\n"
@@ -315,28 +1144,57 @@ def handle_client(client_socket, client_address):
                 response
             )
 
+            with statistics_lock:
+
+                statistics[
+                    "invalid_requests"
+                ] += 1
+
             return
 
+
         request_size = len(
-            data.encode("utf-8")
+            data.encode(
+                "utf-8"
+            )
         )
 
-        print("\nDecrypted HTTP request:")
-        print(data)
-        print("Request Size:", request_size, "bytes")
 
-        # ----------------------------------------------------
-        # Extract HTTP request information
-        # ----------------------------------------------------
+        print(
+            "\nDecrypted HTTP request:"
+        )
 
-        request_lines = data.split("\r\n")
+        print(
+            data
+        )
+
+        print(
+            "Request Size:",
+            request_size,
+            "bytes"
+        )
+
+
+        # ====================================================
+        # HTTP REQUEST PARSING
+        # ====================================================
+
+        request_lines = data.split(
+            "\r\n"
+        )
+
 
         if (
             not request_lines
-            or len(request_lines[0].split()) < 2
+            or
+            len(
+                request_lines[0].split()
+            ) < 2
         ):
 
-            print("Invalid HTTP request.")
+            print(
+                "Invalid HTTP request."
+            )
 
             response = (
                 "HTTP/1.1 400 Bad Request\r\n"
@@ -351,38 +1209,68 @@ def handle_client(client_socket, client_address):
                 response
             )
 
+            with statistics_lock:
+
+                statistics[
+                    "invalid_requests"
+                ] += 1
+
             return
 
-        request_line = request_lines[0]
-        request_parts = request_line.split()
+
+        request_parts = (
+            request_lines[0].split()
+        )
+
 
         method = request_parts[0]
+
         url = request_parts[1]
 
         username = ""
 
-        # ----------------------------------------------------
-        # Process GET request
-        # ----------------------------------------------------
+
+        # ====================================================
+        # GET
+        # ====================================================
 
         if method == "GET":
 
-            parsed_url = urlparse(url)
+            with statistics_lock:
+
+                statistics[
+                    "get_requests"
+                ] += 1
+
+
+            parsed_url = urlparse(
+                url
+            )
+
 
             parameters = parse_qs(
                 parsed_url.query
             )
+
 
             username = parameters.get(
                 "username",
                 [""]
             )[0]
 
-        # ----------------------------------------------------
-        # Process POST request
-        # ----------------------------------------------------
+
+        # ====================================================
+        # POST
+        # ====================================================
 
         elif method == "POST":
+
+            with statistics_lock:
+
+                statistics[
+                    "post_requests"
+                ] += 1
+
 
             if "\r\n\r\n" in data:
 
@@ -391,98 +1279,177 @@ def handle_client(client_socket, client_address):
                     1
                 )[1]
 
-                parameters = parse_qs(body)
+
+                parameters = parse_qs(
+                    body
+                )
+
 
                 username = parameters.get(
                     "username",
                     [""]
                 )[0]
 
-        print("HTTP Method:", method)
-        print("Extracted username:", username)
 
-        # ----------------------------------------------------
-        # MACHINE LEARNING PREDICTION
-        # ----------------------------------------------------
+        else:
+
+            print(
+                "Unsupported HTTP method:",
+                method
+            )
+
+            response = (
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: text/plain\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "HTTP method not supported."
+            )
+
+            send_encrypted_response(
+                client_socket,
+                response
+            )
+
+            return
+
+
+        print(
+            "HTTP Method:",
+            method
+        )
+
+        print(
+            "Username:",
+            username
+        )
+
+
+        # ====================================================
+        # MACHINE LEARNING DETECTION
+        # ====================================================
 
         username_tfidf = vectorizer.transform(
             [username]
         )
 
+
         prediction = model.predict(
             username_tfidf
         )[0]
 
-        print("Prediction:", prediction)
 
-        # ----------------------------------------------------
-        # ALLOW OR BLOCK REQUEST
-        # ----------------------------------------------------
+        print(
+            "ML Prediction:",
+            prediction
+        )
+
+
+        # ====================================================
+        # SQL INJECTION DETECTED
+        # ====================================================
 
         if prediction == "anom":
+
+            print(
+                "\n!!! SQL INJECTION DETECTED !!!"
+            )
+
+
+            action = "BLOCKED"
+
+
+            block_ip(
+                client_ip,
+                "SQL Injection detected"
+            )
+
 
             response = (
                 "HTTP/1.1 403 Forbidden\r\n"
                 "Content-Type: text/plain\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "SQL Injection detected! Request BLOCKED."
+                "SQL Injection detected! "
+                "Request BLOCKED. "
+                "Your IP has been temporarily blocked."
             )
 
-            action = "BLOCKED"
 
-            # Block the source port
-            with blocked_ports_lock:
+            with statistics_lock:
 
-                blocked_ports.add(
-                    client_port
-                )
+                statistics[
+                    "blocked_requests"
+                ] += 1
 
-            print("Action:", action)
-            print("Source port blocked:", client_port)
+
+        # ====================================================
+        # NORMAL REQUEST
+        # ====================================================
 
         else:
+
+            print(
+                "\nNormal request detected."
+            )
+
+
+            action = "ALLOWED"
+
 
             response = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/plain\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "Normal request. Request ALLOWED."
+                "Normal request. "
+                "Request ALLOWED."
             )
 
-            action = "ALLOWED"
 
-            print("Action:", action)
+            with statistics_lock:
 
-        # ----------------------------------------------------
-        # Send encrypted response
-        # ----------------------------------------------------
+                statistics[
+                    "allowed_requests"
+                ] += 1
+
+
+        # ====================================================
+        # SEND RESPONSE
+        # ====================================================
 
         send_encrypted_response(
             client_socket,
             response
         )
 
-        # ----------------------------------------------------
-        # Calculate connection duration
-        # ----------------------------------------------------
+
+        # ====================================================
+        # CONNECTION DURATION
+        # ====================================================
 
         connection_end = datetime.now()
 
+
         connection_duration = (
-            connection_end - connection_start
+            connection_end -
+            connection_start
         ).total_seconds()
+
 
         print(
             "Connection Duration:",
-            round(connection_duration, 4),
+            round(
+                connection_duration,
+                4
+            ),
             "seconds"
         )
 
-        # ----------------------------------------------------
-        # Save security event
-        # ----------------------------------------------------
+
+        # ====================================================
+        # SECURITY LOG
+        # ====================================================
 
         save_log(
             client_ip,
@@ -494,45 +1461,185 @@ def handle_client(client_socket, client_address):
             connection_duration
         )
 
-        print("Security log saved.")
+
+        print(
+            "Security log saved."
+        )
+
 
     except socket.timeout:
 
         print(
-            "Connection timed out for:",
+            "\nConnection timeout:"
+        )
+
+        print(
             client_ip,
             client_port
         )
+
+
+    except ConnectionResetError:
+
+        print(
+            "\nConnection reset by client."
+        )
+
 
     except Exception as error:
 
         print(
-            "Error while processing client:",
+            "\nError:",
             error
         )
 
+
     finally:
+
+        remove_connection(
+            client_ip,
+            client_port
+        )
+
 
         client_socket.close()
 
+
         print(
-            "Connection closed for:",
+            "Connection closed:",
             client_ip,
             client_port
         )
 
 
 # ============================================================
-#                 SERVER CONFIGURATION
+#                    ADMIN CONSOLE
 # ============================================================
 
-HOST = "127.0.0.1"
-PORT = 5000
+def admin_console():
+
+    """
+    Server administrator console.
+
+    Commands:
+
+        stats
+        blocked
+        unblock <IP>
+        connections
+        help
+        exit
+    """
+
+    while True:
+
+        try:
+
+            command = input(
+                "\nADMIN> "
+            ).strip()
+
+
+            if command == "stats":
+
+                show_statistics()
+
+
+            elif command == "blocked":
+
+                list_blocked_ips()
+
+
+            elif command.startswith(
+                "unblock "
+            ):
+
+                ip_address = command.split(
+                    " ",
+                    1
+                )[1].strip()
+
+
+                unblock_ip(
+                    ip_address
+                )
+
+
+            elif command == "connections":
+
+                show_active_connections()
+
+
+            elif command == "help":
+
+                print(
+                    "\nAvailable commands:"
+                )
+
+                print(
+                    "stats"
+                )
+
+                print(
+                    "blocked"
+                )
+
+                print(
+                    "unblock <IP>"
+                )
+
+                print(
+                    "connections"
+                )
+
+                print(
+                    "help"
+                )
+
+                print(
+                    "exit"
+                )
+
+
+            elif command == "exit":
+
+                print(
+                    "Stopping server..."
+                )
+
+                break
+
+
+            elif command == "":
+
+                continue
+
+
+            else:
+
+                print(
+                    "Unknown command."
+                )
+
+                print(
+                    "Type 'help' for commands."
+                )
+
+
+        except EOFError:
+
+            break
+
+
+# ============================================================
+#                    CREATE TCP SERVER
+# ============================================================
 
 server = socket.socket(
     socket.AF_INET,
     socket.SOCK_STREAM
 )
+
 
 server.setsockopt(
     socket.SOL_SOCKET,
@@ -540,40 +1647,160 @@ server.setsockopt(
     1
 )
 
+
 server.bind(
-    (HOST, PORT)
+    (
+        HOST,
+        PORT
+    )
 )
 
-server.listen(50)
 
-print("==============================================")
-print("       NETWORK SECURITY SERVER")
-print("==============================================")
-print("Server started successfully!")
-print("Host:", HOST)
-print("Port:", PORT)
-print("Maximum worker threads:", MAX_WORKERS)
-print("Maximum tokens per client:", MAX_TOKENS)
-print("Token refill rate:", REFILL_RATE, "token/second")
-print("Encryption: ENABLED")
-print("Waiting for client connections...")
-print("Press CTRL + C to stop the server.")
+server.listen(
+    50
+)
 
 
 # ============================================================
-#                 ACCEPT CLIENT CONNECTIONS
+#                    SERVER STARTUP
+# ============================================================
+
+print(
+    "\n=============================================="
+)
+
+print(
+    "          NETWORK SECURITY SERVER"
+)
+
+print(
+    "=============================================="
+)
+
+print(
+    "Server started successfully!"
+)
+
+print(
+    "Host:",
+    HOST
+)
+
+print(
+    "Port:",
+    PORT
+)
+
+print(
+    "Protocol: TCP"
+)
+
+print(
+    "Thread Pool:",
+    MAX_WORKERS
+)
+
+print(
+    "Rate Limit:",
+    MAX_TOKENS,
+    "tokens"
+)
+
+print(
+    "Refill Rate:",
+    REFILL_RATE,
+    "token/second"
+)
+
+print(
+    "Maximum Request Size:",
+    MAX_REQUEST_SIZE,
+    "bytes"
+)
+
+print(
+    "Connection Timeout:",
+    CONNECTION_TIMEOUT,
+    "seconds"
+)
+
+print(
+    "IP Block Duration:",
+    BLOCK_DURATION,
+    "seconds"
+)
+
+print(
+    "Encryption: ENABLED"
+)
+
+print(
+    "ML SQL Injection Detection: ENABLED"
+)
+
+print(
+    "Persistent IP Blocking: ENABLED"
+)
+
+print(
+    "Connection Tracking: ENABLED"
+)
+
+print(
+    "Traffic Statistics: ENABLED"
+)
+
+print(
+    "Admin Console: ENABLED"
+)
+
+print(
+    "=============================================="
+)
+
+print(
+    "Waiting for client connections..."
+)
+
+print(
+    "Type 'help' for administrator commands."
+)
+
+print(
+    "=============================================="
+)
+
+
+# ============================================================
+#                    START ADMIN CONSOLE
+# ============================================================
+
+admin_thread = threading.Thread(
+    target=admin_console,
+    daemon=True
+)
+
+admin_thread.start()
+
+
+# ============================================================
+#                    ACCEPT CLIENTS
 # ============================================================
 
 try:
 
     while True:
 
-        client_socket, client_address = server.accept()
+        client_socket, client_address = (
+            server.accept()
+        )
+
 
         print(
-            "\nClient accepted:",
+            "\nNew connection:",
             client_address
         )
+
 
         thread_pool.submit(
             handle_client,
@@ -581,16 +1808,29 @@ try:
             client_address
         )
 
+
 except KeyboardInterrupt:
 
-    print("\nShutting down server...")
+    print(
+        "\n\nCTRL+C detected."
+    )
+
 
 finally:
 
+    print(
+        "Shutting down server..."
+    )
+
+
     server.close()
+
 
     thread_pool.shutdown(
         wait=True
     )
 
-    print("Server stopped successfully.")
+
+    print(
+        "Server stopped successfully."
+    )

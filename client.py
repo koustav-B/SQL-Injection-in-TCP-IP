@@ -1,45 +1,99 @@
+
 import socket
 from urllib.parse import quote
+
 from cryptography.fernet import Fernet
 
-# -------------------------------------------------
-# Server configuration
-# -------------------------------------------------
+
+# ============================================================
+#                 SERVER CONFIGURATION
+# ============================================================
 
 HOST = "127.0.0.1"
+
 PORT = 5000
 
-# -------------------------------------------------
-# Encryption configuration
-# -------------------------------------------------
 
-# The same key must be used in server.py
+# ============================================================
+#                 ENCRYPTION CONFIGURATION
+# ============================================================
 
-SECRET_KEY = b"nJuxFgnows1o0BjplCFyNYrmSLXjN1w9T86JD2upISY="
+def load_fernet_key():
+    """
+    Read the Fernet encryption key from README.md.
+    """
 
+    try:
+
+        with open(
+            "README.md",
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            for line in file:
+
+                line = line.strip()
+
+                if line.startswith("FERNET_KEY="):
+
+                    key = line.split(
+                        "=",
+                        1
+                    )[1].strip()
+
+                    return key.encode("utf-8")
+
+    except FileNotFoundError:
+
+        raise FileNotFoundError(
+            "README.md not found. "
+            "Please make sure README.md is in the same "
+            "folder as client.py."
+        )
+
+    raise ValueError(
+        "FERNET_KEY not found in README.md."
+    )
+
+
+# Load the same encryption key used by server.py
+SECRET_KEY = load_fernet_key()
+
+# Create Fernet encryption object
 cipher = Fernet(SECRET_KEY)
 
-# -------------------------------------------------
-# Choose HTTP method
-# -------------------------------------------------
 
-method = input("Enter request method (GET/POST): ").upper()
+# ============================================================
+#                 CHOOSE HTTP METHOD
+# ============================================================
 
-# -------------------------------------------------
-# Get username
-# -------------------------------------------------
+method = input(
+    "Enter request method (GET/POST): "
+).upper()
 
-username = input("Enter username: ")
 
-# -------------------------------------------------
-# URL encode username
-# -------------------------------------------------
+# ============================================================
+#                 GET USERNAME
+# ============================================================
 
-encoded_username = quote(username)
+username = input(
+    "Enter username: "
+)
 
-# -------------------------------------------------
-# Create HTTP request
-# -------------------------------------------------
+
+# ============================================================
+#                 URL ENCODE USERNAME
+# ============================================================
+
+encoded_username = quote(
+    username
+)
+
+
+# ============================================================
+#                 CREATE HTTP REQUEST
+# ============================================================
 
 if method == "GET":
 
@@ -50,9 +104,12 @@ if method == "GET":
         "\r\n"
     )
 
+
 elif method == "POST":
 
-    body = f"username={encoded_username}"
+    body = (
+        f"username={encoded_username}"
+    )
 
     request = (
         "POST /login HTTP/1.1\r\n"
@@ -64,112 +121,188 @@ elif method == "POST":
         f"{body}"
     )
 
+
 else:
 
-    print("Invalid request method!")
+    print(
+        "Invalid request method!"
+    )
+
     exit()
 
-# -------------------------------------------------
-# Display original request
-# -------------------------------------------------
 
-print("\nOriginal HTTP request:")
-print(request)
+# ============================================================
+#                 DISPLAY ORIGINAL REQUEST
+# ============================================================
 
-# -------------------------------------------------
-# Encrypt HTTP request
-# -------------------------------------------------
+print(
+    "\nOriginal HTTP request:"
+)
+
+print(
+    request
+)
+
+
+# ============================================================
+#                 ENCRYPT HTTP REQUEST
+# ============================================================
 
 encrypted_request = cipher.encrypt(
     request.encode("utf-8")
 )
 
-print("Encrypted request:")
-print(encrypted_request.decode("utf-8"))
 
-# -------------------------------------------------
-# Create TCP socket
-# -------------------------------------------------
+print(
+    "Encrypted request:"
+)
+
+print(
+    encrypted_request.decode("utf-8")
+)
+
+
+# ============================================================
+#                 CREATE TCP SOCKET
+# ============================================================
 
 client = socket.socket(
     socket.AF_INET,
     socket.SOCK_STREAM
 )
 
+
+# Prevent indefinite waiting
 client.settimeout(5)
+
 
 try:
 
-    # -------------------------------------------------
+    # --------------------------------------------------------
     # Connect to server
-    # -------------------------------------------------
+    # --------------------------------------------------------
 
-    client.connect((HOST, PORT))
+    client.connect(
+        (HOST, PORT)
+    )
 
-    # -------------------------------------------------
+
+    # --------------------------------------------------------
     # Send encrypted request
-    # -------------------------------------------------
+    # --------------------------------------------------------
 
-    client.sendall(encrypted_request)
+    client.sendall(
+        encrypted_request
+    )
 
-    print("\nEncrypted request sent to server.")
 
-    # -------------------------------------------------
+    print(
+        "\nEncrypted request sent to server."
+    )
+
+
+    # --------------------------------------------------------
     # Receive encrypted response
-    # -------------------------------------------------
+    # --------------------------------------------------------
 
-    encrypted_response = client.recv(4096)
+    encrypted_response = client.recv(
+        4096
+    )
+
 
     if not encrypted_response:
 
-        print("\nServer closed the connection without a response.")
+        print(
+            "\nServer closed the connection "
+            "without a response."
+        )
+
 
     else:
 
-        print("\nEncrypted server response:")
-        print(encrypted_response.decode("utf-8"))
+        print(
+            "\nEncrypted server response:"
+        )
 
-        # -------------------------------------------------
+        print(
+            encrypted_response.decode(
+                "utf-8"
+            )
+        )
+
+
+        # ----------------------------------------------------
         # Decrypt server response
-        # -------------------------------------------------
+        # ----------------------------------------------------
 
         response = cipher.decrypt(
             encrypted_response
-        ).decode("utf-8")
+        ).decode(
+            "utf-8"
+        )
 
-        # -------------------------------------------------
+
+        # ----------------------------------------------------
         # Display decrypted response
-        # -------------------------------------------------
+        # ----------------------------------------------------
 
-        print("\nDecrypted server response:")
-        print(response)
+        print(
+            "\nDecrypted server response:"
+        )
+
+        print(
+            response
+        )
+
+
+# ============================================================
+#                 CONNECTION ERROR HANDLING
+# ============================================================
 
 except ConnectionAbortedError:
 
-    print("\nConnection was aborted by the server.")
+    print(
+        "\nConnection was aborted by the server."
+    )
+
 
 except ConnectionResetError:
 
-    print("\nConnection was reset by the server.")
+    print(
+        "\nConnection was reset by the server."
+    )
+
 
 except ConnectionRefusedError:
 
-    print("\nCould not connect to the server. Is server.py running?")
+    print(
+        "\nCould not connect to the server. "
+        "Is server.py running?"
+    )
+
 
 except socket.timeout:
 
-    print("\nThe connection timed out.")
+    print(
+        "\nThe connection timed out."
+    )
+
 
 except Exception as error:
 
-    print(f"\nEncryption or communication error: {error}")
+    print(
+        f"\nEncryption or communication error: {error}"
+    )
+
 
 finally:
 
-    # -------------------------------------------------
+    # --------------------------------------------------------
     # Close connection
-    # -------------------------------------------------
+    # --------------------------------------------------------
 
     client.close()
 
-    print("\nConnection closed.")
+    print(
+        "\nConnection closed."
+    )
